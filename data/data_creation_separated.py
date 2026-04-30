@@ -127,25 +127,6 @@ def read_audio_mono(path: Path, target_sr: int) -> np.ndarray:
     return wav
 
 
-def crop_or_tile(sig: np.ndarray, target_len: int) -> np.ndarray:
-    if sig.ndim != 1:
-        raise ValueError("Expected mono signal")
-    if len(sig) == 0:
-        raise ValueError("Empty audio signal")
-
-    if len(sig) < target_len:
-        repeats = target_len // len(sig)
-        rem = target_len % len(sig)
-        pieces = [sig] * repeats
-        if rem > 0:
-            pieces.append(sig[:rem])
-        out = np.concatenate(pieces, axis=0)
-    else:
-        start = random.randint(0, len(sig) - target_len)
-        out = sig[start:start + target_len]
-    return out.astype(np.float32)
-
-
 def rms(sig: np.ndarray) -> float:
     return float(np.sqrt(np.mean(np.square(sig)) + 1e-12))
 
@@ -319,6 +300,123 @@ def get_text_reference(audio_path: Path) -> str:
     raise ValueError(f"Transcript for {file_id} not found in {txt_path}")
 
 
+def angular_distance_deg(a: float, b: float) -> float:
+    """
+    Smallest circular distance between two angles in degrees.
+    """
+    diff = abs(a - b) % 360.0
+    return min(diff, 360.0 - diff)
+
+
+def sample_doas_with_min_separation(
+    n_sources: int,
+    min_sep_deg: float = 30.0,
+) -> List[float]:
+    """
+    Sample DOAs directly on [0, 360) such that every pair is separated
+    by at least min_sep_deg.
+
+    This avoids failing due to random 2D position rejection.
+    """
+    if n_sources * min_sep_deg > 360:
+        raise ValueError(
+            f"Impossible to place {n_sources} sources with {min_sep_deg}° minimum separation."
+        )
+
+    # Step 1: reserve the minimum separation for each source
+    # Total reserved angle = n_sources * min_sep_deg
+    # Remaining free angle is distributed randomly into n_sources gaps
+    free_angle = 360.0 - n_sources * min_sep_deg
+
+    # Randomly split free_angle into n_sources nonnegative parts
+    gap_fracs = np.random.dirichlet(np.ones(n_sources))
+    extra_gaps = free_angle * gap_fracs
+
+    # Build ordered angles on the circle
+    start = random.uniform(0.0, 360.0)
+    doas = [start]
+    current = start
+    for i in range(1, n_sources):
+        current += min_sep_deg + extra_gaps[i - 1]
+        doas.append(current % 360.0)
+
+    random.shuffle(doas)
+    return doas
+
+def max_radius_in_room_for_angle(
+    room_dim: np.ndarray,
+    mic_center: np.ndarray,
+    theta_deg: float,
+    wall_margin_m: float,
+) -> float:
+    """
+    Maximum radius from mic_center along angle theta_deg such that the point
+    stays inside the room with wall margin.
+    """
+    theta = math.radians(theta_deg)
+    dx = math.cos(theta)
+    dy = math.sin(theta)
+
+    x_min = wall_margin_m
+    x_max = room_dim[0] - wall_margin_m
+    y_min = wall_margin_m
+    y_max = room_dim[1] - wall_margin_m
+
+    radii = []
+
+    if abs(dx) > 1e-12:
+        if dx > 0:
+            radii.append((x_max - mic_center[0]) / dx)
+        else:
+            radii.append((x_min - mic_center[0]) / dx)
+
+    if abs(dy) > 1e-12:
+        if dy > 0:
+            radii.append((y_max - mic_center[1]) / dy)
+        else:
+            radii.append((y_min - mic_center[1]) / dy)
+
+    # keep only positive radii
+    radii = [r for r in radii if r > 0]
+
+    if not radii:
+        raise RuntimeError(f"Could not compute valid radius for angle {theta_deg}")
+
+    return min(radii)
+
+def source_position_from_doa(
+    room_dim: np.ndarray,
+    mic_center: np.ndarray,
+    theta_deg: float,
+    cfg: GenConfig,
+) -> np.ndarray:
+    """
+    Sample a source position at a chosen DOA, with random radius constrained by room boundaries.
+    """
+    r_max = max_radius_in_room_for_angle(
+        room_dim=room_dim,
+        mic_center=mic_center,
+        theta_deg=theta_deg,
+        wall_margin_m=cfg.wall_margin_m,
+    )
+
+    # avoid placing source too close to array center
+    r_min = max(0.5, cfg.mic_radius_m * 3)
+
+    if r_max <= r_min:
+        raise RuntimeError(
+            f"No valid radius range for DOA {theta_deg:.1f}°. r_max={r_max:.3f}, r_min={r_min:.3f}"
+        )
+
+    r = random.uniform(r_min, r_max)
+    theta = math.radians(theta_deg)
+
+    x = mic_center[0] + r * math.cos(theta)
+    y = mic_center[1] + r * math.sin(theta)
+    z = random.uniform(cfg.source_z_min, cfg.source_z_max)
+
+    return np.array([x, y, z], dtype=np.float64)
+
 # =========================
 # Main generation logic
 # =========================
@@ -372,7 +470,18 @@ class Stage1DatasetBuilder:
         speech_clips, noise_clip, text_refs = self._sample_scene_audio()
 
         # Positions
-        spk_positions = [sample_source_position(room_dim, cfg) for _ in range(cfg.n_speakers)]
+        # Sample speaker DOAs first, then place speakers along those DOAs
+        speaker_doas = sample_doas_with_min_separation(
+            n_sources=cfg.n_speakers,
+            min_sep_deg=30.0,
+        )
+
+        spk_positions = [
+            source_position_from_doa(room_dim, mic_center, doa, cfg)
+            for doa in speaker_doas
+        ]
+
+        # Noise remains unconstrained
         noise_position = sample_source_position(room_dim, cfg)
 
         # DOAs for the 6 speakers

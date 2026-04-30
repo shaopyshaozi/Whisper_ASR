@@ -129,7 +129,7 @@ def parse_args() -> argparse.Namespace:
 		help="Root folder containing split folders (e.g., Eval)",
 	)
 	parser.add_argument("--split", type=str, default="Eval", help="Dataset split name")
-	parser.add_argument("--model", type=str, default="small", help="Whisper model name")
+	parser.add_argument("--model", type=str, default="turbo", help="Whisper model name")
 	parser.add_argument("--device", type=str, default="cuda", help="cpu or cuda")
 	parser.add_argument("--language", type=str, default="en", help="Whisper language hint")
 	parser.add_argument("--channel", type=int, default=0, help="Channel index to read from wav (default 0)")
